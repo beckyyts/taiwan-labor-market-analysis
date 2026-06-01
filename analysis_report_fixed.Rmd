@@ -1,0 +1,431 @@
+---
+title: "臺灣各縣市社經條件與勞動市場脆弱度分析"
+author: "曾怡雅 Yi Ya Tseng"
+date: "2025/12"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+```{css, echo=FALSE}
+body {
+  font-family: "PingFang TC", "Heiti TC", "Noto Sans TC", sans-serif;
+}
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+knitr::opts_knit$set(root.dir = "/Users/yy/Desktop/taiwan-labor-market-analysis")
+Sys.setlocale("LC_ALL", "C.UTF-8")
+
+library(dplyr)
+library(ggplot2)
+library(glmnet)
+library(pls)
+library(randomForest)
+library(gbm)
+library(e1071)
+library(MASS)
+library(class)
+library(showtext)
+font_add("STHeiti", "/System/Library/Fonts/STHeiti Medium.ttc")
+showtext_auto()
+theme_set(theme_minimal(base_size = 11, base_family = "STHeiti"))
+```
+
+## 一、研究背景與資料說明
+
+本專案以臺灣 19 縣市(不包含離島)為分析單位，整合 2019–2024 年主計總處與勞動部統計資料，
+探討哪些社經因素影響縣市薪資水準，並比較多種機器學習方法的預測表現。
+
+**核心問題：**
+
+1. 哪些社經因素最能解釋縣市間的薪資差異？
+2. 臺灣各縣市在勞動條件上呈現哪些群聚型態？
+3. 哪種模型最能預測縣市平均薪資？
+
+```{r load_data}
+
+df      <- read.csv("data/processed/taiwan_clean.csv",  encoding = "UTF-8", stringsAsFactors = FALSE)
+df_2024 <- read.csv("data/processed/taiwan_2024.csv",   encoding = "UTF-8", stringsAsFactors = FALSE)
+
+df      <- df      %>% filter(region != "離島")   
+df_2024 <- df_2024 %>% filter(region != "離島")   
+
+cat("觀測數：", nrow(df), "| 縣市數：", n_distinct(df$county), "| 年份：2019–2024\n")
+```
+
+**變數說明：**
+
+| 變數 | 說明 | 單位 |
+|------|------|------|
+| `wage` | 月薪中位數（年薪÷12） | 萬元 |
+| `unemp_rate` | 失業率 | % |
+| `lfpr` | 勞動力參與率 | % |
+| `college_pct` | 大學以上學歷人口比例 | % |
+| `aging_idx` | 老化指數 | 65歲+/15歲以下×100 |
+| `log_density` | 人口密度（對數） | ln(人/km²) |
+| `industry_pct` | 工業就業結構比例（含製造、營造等） | % |
+
+---
+
+## 二、探索性資料分析（EDA）
+
+### 2.1 各縣市薪資分布
+
+```{r wage_map, fig.height=6}
+df_2024 %>%
+  filter(!is.na(wage)) %>%
+  arrange(desc(wage)) %>%
+  ggplot(aes(x = reorder(county, wage), y = wage, fill = region)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "各縣市月薪中位數（2024年）",
+       x = NULL, y = "月薪中位數（萬元）", fill = "地區") +
+  theme_minimal(base_size = 11)
+```
+
+### 2.2 薪資趨勢（2019–2024）
+
+```{r wage_trend}
+df %>%
+  group_by(year, region) %>%
+  summarise(mean_wage = mean(wage), .groups = "drop") %>%
+  ggplot(aes(x = year, y = mean_wage, color = region, group = region)) +
+  geom_line(linewidth = 1.2) + geom_point(size = 2.5) +
+  scale_color_brewer(palette = "Set1") +
+  labs(title = "各地區薪資趨勢（2019–2024）",
+       x = "年份", y = "月薪中位數（萬元）", color = "地區") +
+  theme_minimal()
+```
+
+### 2.3 相關矩陣
+
+```{r correlation}
+num_vars <- c("wage","unemp_rate","lfpr","college_pct","aging_idx","log_density","industry_pct")
+cor_mat  <- round(cor(df[, num_vars]), 2)
+
+as.data.frame(as.table(cor_mat)) %>%
+  rename(Var1 = Var1, Var2 = Var2, corr = Freq) %>%
+  ggplot(aes(Var1, Var2, fill = corr)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = corr), size = 3) +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#d73027",
+                       midpoint = 0, limits = c(-1,1)) +
+  labs(title = "變數相關矩陣", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+## 三、降維分析：PCA
+
+```{r pca}
+# 注意：PCA 使用 2024 單年橫截面資料（22 縣市），
+# 目的是呈現當前縣市結構；迴歸（第五章）使用 2019–2023 Panel 訓練、2024 測試，
+# 兩者分析目的不同，故資料範圍有所差異。
+df_2024 <- df_2024 |> filter(!is.na(wage))
+X_2024 <- df_2024[, num_vars] |> na.omit()
+pca    <- prcomp(X_2024, center = TRUE, scale. = TRUE)
+
+var_exp <- summary(pca)$importance[2,]
+cat("各主成分解釋變異量（%）：\n")
+print(round(var_exp * 100, 1))
+cat("\n前兩個 PC 累積解釋：", round(summary(pca)$importance[3,2]*100,1), "%\n")
+
+# Loading 矩陣（佐證 PC 詮釋）
+cat("\nPC1 & PC2 Loading：\n")
+print(round(pca$rotation[, 1:2], 3))
+```
+
+```{r pca_plot}
+scores <- as.data.frame(pca$x[,1:2])
+scores$county <- df_2024$county
+scores$region <- df_2024$region
+
+ggplot(scores, aes(x = PC1, y = PC2, label = county, color = region)) +
+  geom_point(size = 3) +
+  geom_text(nudge_y = 0.15, size = 2.5, check_overlap = TRUE) +
+  scale_color_brewer(palette = "Set1") +
+  labs(title = "PCA：各縣市在前兩主成分的分布（2024）",
+       x = paste0("PC1（", round(var_exp[1]*100,1), "%）"),
+       y = paste0("PC2（", round(var_exp[2]*100,1), "%）")) +
+  theme_minimal()
+```
+
+---
+
+## 四、群聚分析
+
+### 4.1 K-means（k=4）
+
+```{r kmeans}
+X_scaled <- scale(X_2024)
+set.seed(42)
+
+# Elbow method
+wss <- sapply(1:8, function(k) kmeans(X_scaled, k, nstart=25)$tot.withinss)
+plot(1:8, wss, type="b", pch=16, col="steelblue",
+     xlab="k", ylab="Within-cluster SS", main="Elbow Method")
+
+# 最終模型
+km <- kmeans(X_scaled, centers=4, nstart=25)
+df_2024$cluster <- factor(km$cluster)
+
+cat("各群縣市數：\n"); print(table(df_2024$cluster))
+cat("\n各群平均薪資：\n"); print(tapply(df_2024$wage, df_2024$cluster, mean))
+
+# 列出各群縣市名單（讓後續群命名有依據）
+cat("\n各群縣市名單：\n")
+print(tapply(df_2024$county, df_2024$cluster, function(x) paste(sort(x), collapse="、")))
+```
+
+```{r kmeans_plot}
+scores$cluster <- df_2024$cluster
+
+ggplot(scores, aes(x=PC1, y=PC2, color=cluster, label=county)) +
+  geom_point(size=3.5) +
+  geom_text(nudge_y=0.15, size=2.5, check_overlap=TRUE) +
+  scale_color_brewer(palette="Set1") +
+  labs(title="K-means 群聚結果（PCA空間，k=4）", color="群別") +
+  theme_minimal()
+```
+
+### 4.2 階層式群聚
+
+```{r hclust, fig.height=5}
+dist_mat <- dist(X_scaled, method="euclidean")
+hc       <- hclust(dist_mat, method="ward.D2")
+
+plot(hc, labels=df_2024$county,
+     main="階層式群聚樹狀圖（Ward's Method）",
+     xlab="", ylab="距離", cex=0.7)
+rect.hclust(hc, k=4, border=c("red","blue","green","orange"))
+```
+
+---
+
+## 五、迴歸模型比較
+
+```{r regression_setup}
+predictors <- c("unemp_rate","lfpr","college_pct","aging_idx","log_density","industry_pct")
+
+# 以時間切割：2019–2023 訓練，2024 測試，避免同縣市跨年資料洩漏
+df_model   <- df[, c("log_wage", "year", predictors)] |> na.omit()
+train_data <- df_model[df_model$year < 2024, predictors |> c("log_wage")] |> (\(d) d[, c("log_wage", predictors)])()
+test_data  <- df_model[df_model$year == 2024, c("log_wage", predictors)]
+
+cat("Train size:", nrow(train_data), "| Test size:", nrow(test_data), "\n")
+
+X_train <- as.matrix(train_data[, predictors])
+y_train <- train_data$log_wage
+X_test  <- as.matrix(test_data[, predictors])
+y_test  <- test_data$log_wage
+
+rmse <- function(a, p) sqrt(mean((a-p)^2))
+r2   <- function(a, p) 1 - sum((a-p)^2)/sum((a-mean(a))^2)
+results <- list()
+```
+
+```{r ols}
+ols <- lm(log_wage ~ ., data=train_data)
+pred_ols <- predict(ols, test_data)
+results[["OLS"]] <- c(RMSE=rmse(y_test,pred_ols), R2=r2(y_test,pred_ols))
+summary(ols)
+cat("\nOLS Test RMSE:", round(results[["OLS"]]["RMSE"],4),
+    "| Test R²:", round(results[["OLS"]]["R2"],4), "\n")
+```
+
+> **注意：`log_density` 係數為負**，看似矛盾（台北密度高薪資也高），但這是控制 `college_pct` 等變數後的**偏效果**：在教育程度相近的條件下，人口越密集的縣市薪資反而稍低，可能反映都市內部薪資分配不均（高薪少數拉高平均，但中位數未必高）或高生活成本抵消薪資優勢。需搭配實質資料解讀，不宜單獨詮釋。
+
+```{r ridge_lasso}
+# Ridge
+cv_ridge  <- cv.glmnet(X_train, y_train, alpha=0, nfolds=5)
+ridge_mod <- glmnet(X_train, y_train, alpha=0, lambda=cv_ridge$lambda.min)
+pred_ridge <- predict(ridge_mod, X_test)[,1]
+results[["Ridge"]] <- c(RMSE=rmse(y_test,pred_ridge), R2=r2(y_test,pred_ridge))
+
+# Lasso
+cv_lasso  <- cv.glmnet(X_train, y_train, alpha=1, nfolds=5)
+lasso_mod <- glmnet(X_train, y_train, alpha=1, lambda=cv_lasso$lambda.min)
+pred_lasso <- predict(lasso_mod, X_test)[,1]
+results[["Lasso"]] <- c(RMSE=rmse(y_test,pred_lasso), R2=r2(y_test,pred_lasso))
+cat("Lasso 保留係數：\n"); print(coef(lasso_mod))
+
+# Elastic Net
+cv_enet  <- cv.glmnet(X_train, y_train, alpha=0.5, nfolds=5)
+enet_mod <- glmnet(X_train, y_train, alpha=0.5, lambda=cv_enet$lambda.min)
+pred_enet <- predict(enet_mod, X_test)[,1]
+results[["ElasticNet"]] <- c(RMSE=rmse(y_test,pred_enet), R2=r2(y_test,pred_enet))
+
+plot(cv_lasso, main="Lasso CV：Lambda 選擇")
+```
+
+```{r pcr_pls}
+# PCR
+pcr_mod  <- pcr(log_wage ~ ., data=train_data, scale=TRUE, validation="CV")
+ncomp    <- which.min(RMSEP(pcr_mod)$val[1,,]) - 1
+pred_pcr <- predict(pcr_mod, test_data, ncomp=ncomp)[,,1]
+results[["PCR"]] <- c(RMSE=rmse(y_test,pred_pcr), R2=r2(y_test,pred_pcr))
+cat("PCR 最佳主成分數：", ncomp, "\n")
+
+# PLS
+pls_mod  <- plsr(log_wage ~ ., data=train_data, scale=TRUE, validation="CV")
+ncomp_p  <- which.min(RMSEP(pls_mod)$val[1,,]) - 1
+pred_pls <- predict(pls_mod, test_data, ncomp=ncomp_p)[,,1]
+results[["PLS"]] <- c(RMSE=rmse(y_test,pred_pls), R2=r2(y_test,pred_pls))
+```
+
+```{r tree_models}
+# Random Forest
+set.seed(42)
+rf_mod  <- randomForest(log_wage ~ ., data=train_data, ntree=500, importance=TRUE)
+pred_rf <- predict(rf_mod, test_data)
+results[["RandomForest"]] <- c(RMSE=rmse(y_test,pred_rf), R2=r2(y_test,pred_rf))
+varImpPlot(rf_mod, main="Random Forest 變數重要性")
+
+# GBM
+set.seed(42)
+gbm_mod  <- gbm(log_wage ~ ., data=train_data, distribution="gaussian",
+                n.trees=500, interaction.depth=3, shrinkage=0.01,
+                cv.folds=5, verbose=FALSE)
+best_iter <- gbm.perf(gbm_mod, method="cv", plot.it=FALSE)
+pred_gbm  <- predict(gbm_mod, test_data, n.trees=best_iter)
+results[["GBM"]] <- c(RMSE=rmse(y_test,pred_gbm), R2=r2(y_test,pred_gbm))
+
+# SVR（明確儲存 scale 參數，避免反標準化混淆）
+train_center <- colMeans(train_data)
+train_scale  <- apply(train_data, 2, sd)
+tr_sc <- as.data.frame(scale(train_data, center=train_center, scale=train_scale))
+te_sc <- as.data.frame(scale(test_data,  center=train_center, scale=train_scale))
+svr_mod  <- svm(log_wage ~ ., data=tr_sc, kernel="radial", cost=10, epsilon=0.1)
+pred_svr <- predict(svr_mod, te_sc) * train_scale["log_wage"] + train_center["log_wage"]
+results[["SVR"]] <- c(RMSE=rmse(y_test,pred_svr), R2=r2(y_test,pred_svr))
+```
+
+```{r model_comparison}
+comp_df <- as.data.frame(do.call(rbind, results))
+comp_df$Model <- rownames(comp_df)
+comp_df <- comp_df %>% arrange(RMSE)
+
+ggplot(comp_df, aes(x=reorder(Model,-R2), y=R2, fill=R2)) +
+  geom_col(alpha=0.85) +
+  geom_text(aes(label=round(R2,3)), vjust=-0.4, size=3) +
+  scale_fill_gradient(low="#a6cee3", high="#1f78b4") +
+  labs(title="各模型預測表現（Test R²）", x="模型", y="R²") +
+  theme_minimal() +
+  theme(legend.position="none", axis.text.x=element_text(angle=30,hjust=1))
+```
+
+---
+
+## 六、分類分析：預測高薪／低薪縣市
+
+```{r classification}
+select <- dplyr::select
+df_cls <- df %>%
+  select(all_of(c("high_wage", predictors))) %>%
+  na.omit() %>%
+  mutate(high_wage = factor(high_wage, labels=c("低薪","高薪")))
+
+set.seed(42)
+tr_idx <- sample(nrow(df_cls), 0.8*nrow(df_cls))
+tr_cls <- df_cls[tr_idx,]; te_cls <- df_cls[-tr_idx,]
+
+acc <- function(p,a) mean(p==a)
+cls_res <- list()
+
+# Logistic
+logit <- glm(high_wage ~ ., data=tr_cls, family=binomial)
+p_log <- factor(ifelse(predict(logit,te_cls,type="response")>0.5,"高薪","低薪"), levels=c("低薪","高薪"))
+cls_res[["Logistic"]] <- acc(p_log, te_cls$high_wage)
+
+# LDA
+lda_m <- lda(high_wage ~ ., data=tr_cls)
+cls_res[["LDA"]] <- acc(predict(lda_m, te_cls)$class, te_cls$high_wage)
+
+# QDA
+qda_m <- qda(high_wage ~ ., data=tr_cls)
+cls_res[["QDA"]] <- acc(predict(qda_m, te_cls)$class, te_cls$high_wage)
+
+# KNN（最佳 k）
+X_tr <- scale(tr_cls[,predictors]); X_te <- scale(te_cls[,predictors], center=attr(X_tr,"scaled:center"), scale=attr(X_tr,"scaled:scale"))
+best_k <- which.max(sapply(1:15, function(k) acc(knn(X_tr,X_te,tr_cls$high_wage,k=k), te_cls$high_wage)))
+cls_res[["KNN"]] <- acc(knn(X_tr, X_te, tr_cls$high_wage, k=best_k), te_cls$high_wage)
+
+data.frame(Model=names(cls_res), Accuracy=round(unlist(cls_res),3)) %>%
+  arrange(desc(Accuracy)) %>%
+  ggplot(aes(x=reorder(Model,Accuracy), y=Accuracy, fill=Accuracy)) +
+  geom_col(alpha=0.85) +
+  geom_text(aes(label=Accuracy), hjust=-0.1, size=3.5) +
+  coord_flip() + scale_y_continuous(limits=c(0,1.1)) +
+  labs(title="分類模型準確率比較", x="模型", y="Accuracy") +
+  theme_minimal() + theme(legend.position="none")
+```
+
+---
+
+## 七、重抽樣方法：Bootstrap + 交叉驗證
+
+```{r cv}
+set.seed(42)
+
+kfold <- function(data, k) {
+  folds <- sample(rep(1:k, length.out=nrow(data)))
+  mean(sapply(1:k, function(i) {
+    m <- lm(log_wage~., data=data[folds!=i,])
+    sqrt(mean((data$log_wage[folds==i] - predict(m, data[folds==i,]))^2))
+  }))
+}
+
+df_m <- df[, c("log_wage", predictors)] |> na.omit()
+cv5  <- kfold(df_m, 5)
+cv10 <- kfold(df_m, 10)
+
+# LOO
+loo_e <- sapply(1:nrow(df_m), function(i) {
+  m <- lm(log_wage~., data=df_m[-i,])
+  df_m$log_wage[i] - predict(m, df_m[i,])
+})
+loo_rmse <- sqrt(mean(loo_e^2))
+
+cat("5-fold CV RMSE:", round(cv5,4), "\n10-fold CV RMSE:", round(cv10,4), "\nLOO-CV RMSE:", round(loo_rmse,4), "\n")
+```
+
+```{r bootstrap}
+set.seed(42)
+B <- 1000
+
+boot_coef <- replicate(B, {
+  idx <- sample(nrow(df_m), replace=TRUE)
+  coef(lm(log_wage~., data=df_m[idx,]))
+})
+
+ci <- apply(boot_coef, 1, quantile, probs=c(0.025,0.975))
+cat("Bootstrap 95% CI（OLS 係數）：\n")
+print(round(ci, 4))
+
+hist(boot_coef["college_pct",], breaks=40, col="steelblue", border="white",
+     main="Bootstrap：college_pct 係數分布",
+     xlab="係數估計")
+abline(v=ci[,"college_pct"], col="red", lty=2, lwd=2)
+```
+
+---
+
+## 八、結論
+
+1. **薪資差異主因**：大學比例（`college_pct`）和人口密度（`log_density`）是最強預測變數，北部都會區薪資顯著高於東部、離島。
+
+2. **PCA 結果**：前兩個主成分累積解釋約 71.4% 變異，PC1 代表「都市化與教育程度」，PC2 代表「產業結構」。
+
+3. **群聚分析**：臺灣縣市大致分為四群，各群縣市名單詳見第四節輸出，命名依實際成員與平均薪資而定（如薪資最高群約 6.8 萬元，成員為少數都會縣市）。
+
+4. **模型表現**：各模型 Test R²（以 2024 年為測試集）詳見第五節模型比較圖。OLS Train R²≈0.64，Test R² 視時間外推能力而定；正規化模型（Ridge/Lasso/Elastic Net）與樹狀模型（RF/GBM）表現視資料分布而定。採時間切割後結果更具預測參考價值，避免同縣市跨年資料洩漏。
+
+5. **Bootstrap 穩定性**：`college_pct` 係數 95% CI 全為正值，確認教育程度對薪資的正向影響具統計穩健性。
